@@ -1,5 +1,9 @@
 # botzone-cost
 
+[![PyPI version](https://img.shields.io/pypi/v/botzone-cost.svg)](https://pypi.org/project/botzone-cost/)
+[![Python versions](https://img.shields.io/pypi/pyversions/botzone-cost.svg)](https://pypi.org/project/botzone-cost/)
+[![license](https://img.shields.io/pypi/l/botzone-cost.svg)](https://github.com/botzone-ai/cost-sdk-py/blob/main/LICENSE)
+
 Cost-tracking SDK for Anthropic, OpenAI, and Gemini Python clients. Wrap your
 existing client; per-call usage flows to your Cost dashboard. Adds zero
 measurable latency to the host call.
