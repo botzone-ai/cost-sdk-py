@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - 2026-06-XX
+## 0.1.0 - 2026-05-27
 
 - Initial public release.
 - Wraps Anthropic, OpenAI, and Google Generative AI SDKs.
