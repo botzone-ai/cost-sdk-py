@@ -1,0 +1,25 @@
+# Node (defensive; this repo is Python-only)
+node_modules/
+dist/
+.npm/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+
+# Env / secrets
+.env
+.env.local
+.env.*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
