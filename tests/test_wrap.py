@@ -115,3 +115,96 @@ def test_passthrough_returns_result(monkeypatch):
     client = wrap(_fake_anthropic(), provider="anthropic")
     result = client.messages.create(model="claude-sonnet-4-6", messages=[])
     assert result.model == "claude-sonnet-4-6"
+
+
+# --- regression tests for the ingestion payload contract (fixed in 0.1.1) ---
+
+import re
+
+from botzone_cost.queue import IngestionQueue
+
+
+def test_occurred_at_is_z_suffixed(monkeypatch):
+    """occurredAt must be RFC3339 with a 'Z' suffix; a '+00:00' offset 400s."""
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    client = wrap(_fake_anthropic(), route="t", provider="anthropic")
+    client.messages.create(model="claude-sonnet-4-6", messages=[])
+    occurred = body_calls[0]["occurredAt"]
+    assert occurred.endswith("Z")
+    assert "+" not in occurred
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", occurred)
+
+
+def test_user_id_hash_omitted_when_absent(monkeypatch):
+    """No user_id -> field absent, NOT null (the server rejects an explicit null)."""
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    client = wrap(_fake_anthropic(), route="t", provider="anthropic")
+    client.messages.create(model="claude-sonnet-4-6", messages=[])
+    assert "userIdHash" not in body_calls[0]
+
+
+def test_user_id_hash_present_and_hashed_when_given(monkeypatch):
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    client = wrap(_fake_anthropic(), route="t", user_id="user-42", provider="anthropic")
+    client.messages.create(model="claude-sonnet-4-6", messages=[])
+    h = body_calls[0]["userIdHash"]
+    assert isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)  # sha256 hex
+
+
+def test_route_and_feature_tag_omitted_when_none(monkeypatch):
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    client = wrap(_fake_anthropic(), provider="anthropic")  # no route / feature_tag
+    client.messages.create(model="claude-sonnet-4-6", messages=[])
+    ev = body_calls[0]
+    assert "route" not in ev and "featureTag" not in ev
+
+
+class _FakeResp:
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.text = text
+
+
+class _FakeHttp:
+    def __init__(self, status_code):
+        self.status_code = status_code
+        self.calls = 0
+
+    def post(self, *a, **k):
+        self.calls += 1
+        return _FakeResp(self.status_code, "boom")
+
+
+def _queue(http):
+    return IngestionQueue(api_key="cost_sk_test", endpoint="http://localhost:3001", http=http)
+
+
+def test_send_records_rejection_on_4xx(monkeypatch):
+    """A 4xx must be surfaced (failed_count), not silently swallowed, and not retried."""
+    monkeypatch.setattr("botzone_cost.queue.time.sleep", lambda *_: None)
+    http = _FakeHttp(400)
+    q = _queue(http)
+    q._send([{"x": 1}])
+    assert q.failed_count() == 1
+    assert http.calls == 1
+
+
+def test_send_retries_then_fails_on_5xx(monkeypatch):
+    monkeypatch.setattr("botzone_cost.queue.time.sleep", lambda *_: None)
+    http = _FakeHttp(503)
+    q = _queue(http)
+    q._send([{"x": 1}])
+    assert http.calls == 4  # initial + 3 retries
+    assert q.failed_count() == 1
+
+
+def test_send_success_no_failure():
+    http = _FakeHttp(202)
+    q = _queue(http)
+    q._send([{"x": 1}])
+    assert q.failed_count() == 0
+    assert http.calls == 1

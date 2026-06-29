@@ -32,7 +32,9 @@ def _sha256(s: str) -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    # RFC3339 with millisecond precision and a 'Z' suffix. The ingestion API's
+    # datetime validator rejects a numeric offset such as '+00:00'.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def wrap(
@@ -96,6 +98,33 @@ def _emit(queue: Optional[IngestionQueue], event: dict) -> None:
         queue.enqueue(event)
 
 
+def _event(provider, model, prompt_tokens, completion_tokens, cached,
+           cache_creation, latency_ms, route, user_hash, feature_tag):
+    """Build one ingestion event.
+
+    Optional fields that are None are OMITTED, not sent as null: the ingestion
+    API expects a string-or-absent for ``userIdHash`` / ``route`` / ``featureTag``
+    and rejects an explicit null (HTTP 400).
+    """
+    event = {
+        "provider": provider,
+        "model": model,
+        "promptTokens": prompt_tokens,
+        "completionTokens": completion_tokens,
+        "cachedTokens": cached,
+        "cacheCreationTokens": cache_creation,
+        "latencyMs": latency_ms,
+        "occurredAt": _now(),
+    }
+    if route is not None:
+        event["route"] = route
+    if user_hash is not None:
+        event["userIdHash"] = user_hash
+    if feature_tag is not None:
+        event["featureTag"] = feature_tag
+    return event
+
+
 def _wrap_anthropic(client: Any, queue, route, user_hash, feature_tag, capture_bodies):
     original = client.messages.create
 
@@ -109,19 +138,12 @@ def _wrap_anthropic(client: Any, queue, route, user_hash, feature_tag, capture_b
             output_tokens = getattr(usage, "output_tokens", 0) or 0
             cached = getattr(usage, "cache_read_input_tokens", 0) or 0
             cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
-            _emit(queue, {
-                "provider": "anthropic",
-                "model": kwargs.get("model") or getattr(result, "model", "unknown"),
-                "promptTokens": input_tokens,
-                "completionTokens": output_tokens,
-                "cachedTokens": cached,
-                "cacheCreationTokens": cache_creation,
-                "latencyMs": latency_ms,
-                "route": route,
-                "userIdHash": user_hash,
-                "featureTag": feature_tag,
-                "occurredAt": _now(),
-            })
+            _emit(queue, _event(
+                "anthropic",
+                kwargs.get("model") or getattr(result, "model", "unknown"),
+                input_tokens, output_tokens, cached, cache_creation,
+                latency_ms, route, user_hash, feature_tag,
+            ))
         return result
 
     client.messages.create = wrapped
@@ -141,19 +163,12 @@ def _wrap_openai(client: Any, queue, route, user_hash, feature_tag, capture_bodi
             completion_tokens = getattr(usage, "completion_tokens", 0) or 0
             details = getattr(usage, "prompt_tokens_details", None)
             cached = getattr(details, "cached_tokens", 0) if details else 0
-            _emit(queue, {
-                "provider": "openai",
-                "model": kwargs.get("model") or getattr(result, "model", "unknown"),
-                "promptTokens": prompt_tokens,
-                "completionTokens": completion_tokens,
-                "cachedTokens": cached or 0,
-                "cacheCreationTokens": 0,
-                "latencyMs": latency_ms,
-                "route": route,
-                "userIdHash": user_hash,
-                "featureTag": feature_tag,
-                "occurredAt": _now(),
-            })
+            _emit(queue, _event(
+                "openai",
+                kwargs.get("model") or getattr(result, "model", "unknown"),
+                prompt_tokens, completion_tokens, cached or 0, 0,
+                latency_ms, route, user_hash, feature_tag,
+            ))
         return result
 
     client.chat.completions.create = wrapped
@@ -176,19 +191,12 @@ def _wrap_gemini(model: Any, queue, route, user_hash, feature_tag, capture_bodie
             prompt = getattr(usage, "prompt_token_count", 0) if usage else 0
             completion = getattr(usage, "candidates_token_count", 0) if usage else 0
             cached = getattr(usage, "cached_content_token_count", 0) if usage else 0
-            _emit(queue, {
-                "provider": "gemini",
-                "model": model_name,
-                "promptTokens": prompt or 0,
-                "completionTokens": completion or 0,
-                "cachedTokens": cached or 0,
-                "cacheCreationTokens": 0,
-                "latencyMs": latency_ms,
-                "route": route,
-                "userIdHash": user_hash,
-                "featureTag": feature_tag,
-                "occurredAt": _now(),
-            })
+            _emit(queue, _event(
+                "gemini",
+                model_name,
+                prompt or 0, completion or 0, cached or 0, 0,
+                latency_ms, route, user_hash, feature_tag,
+            ))
         return result
 
     model.generate_content = wrapped

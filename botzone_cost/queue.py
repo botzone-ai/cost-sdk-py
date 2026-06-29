@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import threading
 import time
 from typing import Optional
 
 import httpx
+
+logger = logging.getLogger("botzone_cost")
 
 
 class IngestionQueue:
@@ -23,6 +26,7 @@ class IngestionQueue:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._dropped = 0
+        self._failed = 0
         self._http = http or httpx.Client(timeout=5.0)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -45,19 +49,51 @@ class IngestionQueue:
             self._send(chunk)
 
     def dropped_count(self) -> int:
+        """Events discarded locally because the buffer was full."""
         return self._dropped
+
+    def failed_count(self) -> int:
+        """Events the server rejected, or that exhausted network retries."""
+        return self._failed
+
+    # Retry only when the condition is transient.
+    _RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
     def _send(self, batch: list[dict], attempt: int = 0) -> None:
         try:
-            self._http.post(
+            resp = self._http.post(
                 f"{self._endpoint}/api/v1/events",
                 headers={"x-api-key": self._api_key, "content-type": "application/json"},
                 content=json.dumps({"events": batch}),
             )
-        except Exception:
+        except Exception as exc:  # transport error: DNS, connect, read timeout
             if attempt < 3:
                 time.sleep(0.2 * (2 ** attempt))
                 self._send(batch, attempt + 1)
+            else:
+                self._failed += len(batch)
+                logger.warning(
+                    "botzone-cost: dropping %d event(s) after network errors: %s",
+                    len(batch), exc,
+                )
+            return
+
+        if resp.status_code < 300:
+            return  # accepted
+
+        if resp.status_code in self._RETRY_STATUS and attempt < 3:
+            time.sleep(0.2 * (2 ** attempt))
+            self._send(batch, attempt + 1)
+            return
+
+        # Permanent rejection (bad key, invalid payload, ...). Surface it rather
+        # than silently dropping - it is almost always a misconfiguration.
+        self._failed += len(batch)
+        body = (resp.text or "")[:300]
+        logger.warning(
+            "botzone-cost: server rejected %d event(s): HTTP %d %s",
+            len(batch), resp.status_code, body,
+        )
 
     def _loop(self) -> None:
         while not self._stop.is_set():
