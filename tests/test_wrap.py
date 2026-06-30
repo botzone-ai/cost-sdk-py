@@ -208,3 +208,163 @@ def test_send_success_no_failure():
     q._send([{"x": 1}])
     assert q.failed_count() == 0
     assert http.calls == 1
+
+
+# --- body capture (0.1.2): rawRequest / rawResponse for verify-downgrade ---
+#
+# These shapes are read verbatim by the runtime worker:
+#   replay()              -> rawRequest      (Anthropic/OpenAI kwargs; Gemini {contents})
+#   extractBaseline()     -> rawResponse     (Anthropic .content[]; OpenAI .choices[];
+#                                             Gemini {text})
+#   extractPromptForJudge -> rawRequest.messages / rawRequest.contents
+# Capture is OPT-IN (capture_bodies=True) and must NEVER break the wrapped call.
+
+
+class _Pydanticish:
+    """Mimics a pydantic v2 response: attribute access plus model_dump(mode=...)."""
+
+    def __init__(self, attrs, dump):
+        self._dump = dump
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+    def model_dump(self, mode="python"):
+        return self._dump
+
+
+def _fake_anthropic_pydantic():
+    client = MagicMock()
+    client.messages.create.return_value = _Pydanticish(
+        attrs={
+            "model": "claude-sonnet-4-6",
+            "usage": SimpleNamespace(
+                input_tokens=100, output_tokens=50,
+                cache_read_input_tokens=0, cache_creation_input_tokens=0,
+            ),
+        },
+        dump={
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "Hi there"}],
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        },
+    )
+    return client
+
+
+def _fake_openai_pydantic():
+    client = MagicMock()
+    client.chat.completions.create.return_value = _Pydanticish(
+        attrs={
+            "model": "gpt-4o-mini",
+            "usage": SimpleNamespace(
+                prompt_tokens=200, completion_tokens=75,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+            ),
+        },
+        dump={
+            "model": "gpt-4o-mini",
+            "choices": [{"message": {"role": "assistant", "content": "42"}}],
+            "usage": {"prompt_tokens": 200, "completion_tokens": 75},
+        },
+    )
+    return client
+
+
+def _fake_gemini_capture():
+    model = MagicMock()
+    model.model_name = "gemini-2.5-flash"
+    model.generate_content.return_value = SimpleNamespace(
+        text="The capital is Paris.",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10, candidates_token_count=5, cached_content_token_count=0,
+        ),
+    )
+    return model
+
+
+def test_capture_bodies_default_off(monkeypatch):
+    """Default is opt-OUT: no bodies leave the process unless explicitly enabled."""
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    client = wrap(_fake_anthropic(), route="t", provider="anthropic")
+    client.messages.create(model="claude-sonnet-4-6", messages=[{"role": "user", "content": "hi"}])
+    ev = body_calls[0]
+    assert "rawRequest" not in ev
+    assert "rawResponse" not in ev
+
+
+def test_capture_bodies_anthropic_shapes(monkeypatch):
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    client = wrap(_fake_anthropic_pydantic(), route="t", provider="anthropic", capture_bodies=True)
+    client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=256,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    ev = body_calls[0]
+    # replay() reads rawRequest verbatim and needs messages + max_tokens
+    assert ev["rawRequest"]["messages"] == [{"role": "user", "content": "hi"}]
+    assert ev["rawRequest"]["max_tokens"] == 256
+    # extractBaseline() reads rawResponse.content[].text
+    assert ev["rawResponse"]["content"][0]["text"] == "Hi there"
+
+
+def test_capture_bodies_openai_shapes(monkeypatch):
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    client = wrap(_fake_openai_pydantic(), route="t", provider="openai", capture_bodies=True)
+    client.chat.completions.create(
+        model="gpt-4o-mini", messages=[{"role": "user", "content": "2+2?"}],
+    )
+    ev = body_calls[0]
+    assert ev["rawRequest"]["messages"] == [{"role": "user", "content": "2+2?"}]
+    # extractBaseline() reads rawResponse.choices[0].message.content
+    assert ev["rawResponse"]["choices"][0]["message"]["content"] == "42"
+
+
+def test_capture_bodies_gemini_normalises_string(monkeypatch):
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    model = wrap(_fake_gemini_capture(), route="t", provider="gemini", capture_bodies=True)
+    model.generate_content("What is the capital of France?")
+    ev = body_calls[0]
+    # replay() feeds rawRequest to generateContent: needs Content[] under .contents
+    assert ev["rawRequest"] == {
+        "contents": [{"role": "user", "parts": [{"text": "What is the capital of France?"}]}],
+    }
+    # extractBaseline() Gemini path reads the decoded {text}
+    assert ev["rawResponse"] == {"text": "The capital is Paris."}
+
+
+def test_capture_bodies_gemini_passes_through_content_list(monkeypatch):
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    model = wrap(_fake_gemini_capture(), route="t", provider="gemini", capture_bodies=True)
+    contents = [{"role": "user", "parts": [{"text": "hello"}]}]
+    model.generate_content(contents)
+    assert body_calls[0]["rawRequest"] == {"contents": contents}
+
+
+class _BoomResponse:
+    """A response whose serialisation blows up - must not break the call."""
+
+    model = "claude-sonnet-4-6"
+    usage = SimpleNamespace(
+        input_tokens=1, output_tokens=1,
+        cache_read_input_tokens=0, cache_creation_input_tokens=0,
+    )
+
+    def model_dump(self, mode="python"):
+        raise RuntimeError("cannot serialise this object")
+
+
+def test_capture_failure_never_breaks_call(monkeypatch):
+    body_calls: list = []
+    _setup(monkeypatch, body_calls)
+    client = MagicMock()
+    client.messages.create.return_value = _BoomResponse()
+    wrapped = wrap(client, provider="anthropic", capture_bodies=True)
+    result = wrapped.messages.create(model="claude-sonnet-4-6", messages=[])
+    assert isinstance(result, _BoomResponse)   # the real call still returns
+    assert len(body_calls) == 1                # the metadata event still emits
+    assert "rawResponse" not in body_calls[0]  # the unserialisable body is dropped, not raised
